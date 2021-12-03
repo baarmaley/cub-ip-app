@@ -80,6 +80,7 @@ dependencies = [
  "anyhow",
  "base64",
  "env_logger",
+ "futures",
  "hyper",
  "log",
  "paho-mqtt",
