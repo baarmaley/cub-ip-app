@@ -10,6 +10,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 extern crate quick_xml;
 extern crate serde;
+#[macro_use]
+extern crate clap;
 
 use paho_mqtt as mqtt;
 use paho_mqtt::QOS_1;
@@ -233,6 +235,8 @@ async fn publish_version(version_topic: &str, mqtt_client: &mqtt::AsyncClient) {
 async fn subscribe_cmd(
     config: Arc<Config>,
     relay_cmd_topic: String,
+    time_relay_turn_on_cmd_topic: String,
+    time_relay_turn_off_cmd_topic: String,
     mqtt_client: mqtt::AsyncClient,
     mut strm: futures::channel::mpsc::Receiver<Option<mqtt::Message>>,
 ) {
@@ -240,17 +244,42 @@ async fn subscribe_cmd(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    while let Err(e) = mqtt_client.subscribe(&relay_cmd_topic, mqtt::QOS_1).await {
+    while let Err(e) = mqtt_client
+        .subscribe_many(
+            &[
+                &relay_cmd_topic,
+                &time_relay_turn_on_cmd_topic,
+                &time_relay_turn_off_cmd_topic,
+            ],
+            &[mqtt::QOS_1, mqtt::QOS_1, mqtt::QOS_1],
+        )
+        .await
+    {
         warn!("subscribe on mqtt topic failed ({:?}).", e);
     }
 
     while let Some(msg_opt) = strm.next().await {
         if let Some(msg) = msg_opt {
             // let payload = std::str::from_utf8(msg.payload().);
-            let action = match msg.payload() {
-                b"0" => Some(CubIpRelayAction::RelayTurnOff),
-                b"1" => Some(CubIpRelayAction::RelayTurnOn),
-                _ => None,
+            let to_usize = |time_as_str: &[u8]| {
+                std::str::from_utf8(time_as_str)
+                    .map(|v| v.parse::<usize>().ok())
+                    .ok()
+                    .flatten()
+            };
+
+            let action = if msg.topic() == relay_cmd_topic {
+                match msg.payload() {
+                    b"0" => Some(CubIpRelayAction::RelayTurnOff),
+                    b"1" => Some(CubIpRelayAction::RelayTurnOn),
+                    _ => None,
+                }
+            } else if msg.topic() == time_relay_turn_on_cmd_topic {
+                to_usize(msg.payload()).map(|v| CubIpRelayAction::TimeRelayTurnOn(v))
+            } else if msg.topic() == time_relay_turn_off_cmd_topic {
+                to_usize(msg.payload()).map(|v| CubIpRelayAction::TimeRelayTurnOff(v))
+            } else {
+                None
             };
 
             if let Some(action) = action {
@@ -280,6 +309,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let temperature_topic = format!("/{}/temperature", config.mqtt_main_topic);
     let relay_topic = format!("/{}/relay/state", config.mqtt_main_topic);
     let relay_cmd_topic = format!("/{}/relay/cmd", config.mqtt_main_topic);
+    let relay_time_topic = format!("/{}/time_relay/state", config.mqtt_main_topic);
+    let time_relay_turn_on_cmd_topic =
+        format!("/{}/time_relay/cmd/turn_on", config.mqtt_main_topic);
+    let time_relay_turn_off_cmd_topic =
+        format!("/{}/time_relay/cmd/turn_off", config.mqtt_main_topic);
     let pin_1_topic = format!("/{}/pin_1/state", config.mqtt_main_topic);
     let pin_2_topic = format!("/{}/pin_2/state", config.mqtt_main_topic);
     let version_topic = format!("/{}/version", config.mqtt_main_topic);
@@ -328,6 +362,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(subscribe_cmd(
         config,
         relay_cmd_topic,
+        time_relay_turn_on_cmd_topic,
+        time_relay_turn_off_cmd_topic,
         cli.clone(),
         cli.get_stream(25),
     ));
@@ -360,12 +396,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut prev_relay_value = None;
     let mut prev_pin_1_value = None;
     let mut prev_pin_2_value = None;
+    let mut prev_time_relay_value = None;
 
     let response_process = |response: anyhow::Result<CubIpResponse>,
                             prev_temperature_value: &mut Option<String>,
                             prev_relay_value: &mut Option<String>,
                             prev_pin_1_value: &mut Option<String>,
-                            prev_pin_2_value: &mut Option<String>| {
+                            prev_pin_2_value: &mut Option<String>,
+                            prev_time_relay_value: &mut Option<String>| {
         let mut messages = vec![];
         match response {
             Ok(data) => {
@@ -416,6 +454,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     prev_pin_2_value,
                     mqtt::QOS_1,
                 );
+                add_message(
+                    &relay_time_topic,
+                    &Ok::<String, anyhow::Error>(data.tmrel),
+                    prev_time_relay_value,
+                    mqtt::QOS_1,
+                );
             }
             Err(e) => {
                 warn!("Parsed response failed ({:?}).", e);
@@ -442,6 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut prev_relay_value,
                         &mut prev_pin_1_value,
                         &mut prev_pin_2_value,
+                        &mut prev_time_relay_value,
                     )
                     .await
                 }
