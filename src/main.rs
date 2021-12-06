@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context};
 use futures::stream::StreamExt;
 use log::{info, warn};
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io;
@@ -16,7 +17,7 @@ extern crate clap;
 use paho_mqtt as mqtt;
 use paho_mqtt::QOS_1;
 use quick_xml::de::from_str;
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
 
 #[derive(Debug, Deserialize, PartialEq)]
 struct CubIpResponse {
@@ -42,44 +43,42 @@ enum CubIpRelayAction {
     TimeRelayTurnOff(usize),
 }
 
+#[derive(Deserialize)]
 struct Config {
     pub cub_ip_address: String,
     pub cub_ip_login: String,
     pub cub_ip_password: String,
+    #[serde(deserialize_with = "deserialize_duration_from_str")]
     pub cub_ip_connection_timeout: Duration,
+    #[serde(deserialize_with = "deserialize_duration_from_str")]
     pub cub_ip_read_timeout: Duration,
+    #[serde(deserialize_with = "deserialize_duration_from_str")]
     pub cub_ip_write_timeout: Duration,
+    #[serde(deserialize_with = "deserialize_duration_from_str")]
     pub cub_ip_request_timeout: Duration,
     pub mqtt_main_topic: String,
     pub mqtt_host: String,
     pub mqtt_name_client: String,
 }
 
+fn deserialize_duration_from_str<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    parse_duration::parse(s.as_str()).map_err(de::Error::custom)
+}
+
 impl Config {
-    pub fn read_from_file(path: &str) -> Config {
-        let cub_ip_address = "192.168.0.117:80".to_string();
-        let localhost = "127.0.0.1:8080";
-        let cub_ip_login = "admin".to_string();
-        let cub_ip_password = "5555".to_string();
-        let cub_ip_connection_timeout = Duration::from_millis(500);
-        let cub_ip_read_timeout = Duration::from_millis(500);
-        let cub_ip_write_timeout = Duration::from_millis(500);
-        let cub_ip_request_timeout = Duration::from_millis(500);
-        let mqtt_main_topic = "cub_ip_device".to_string();
-        let mqtt_host = "192.168.0.114:1883".to_string();
-        let mqtt_name_client = "cub_ip_service".to_string();
-        Config {
-            cub_ip_address,
-            cub_ip_login,
-            cub_ip_password,
-            cub_ip_connection_timeout,
-            cub_ip_read_timeout,
-            cub_ip_write_timeout,
-            cub_ip_request_timeout,
-            mqtt_main_topic,
-            mqtt_host,
-            mqtt_name_client,
-        }
+    pub fn read_from_file(path: &str) -> anyhow::Result<Config> {
+        let mut settings = config::Config::default();
+        settings
+            .merge(config::File::with_name(path))
+            .with_context(|| format!("Config::read_from_file(): open file {}", path))?;
+
+        settings
+            .get("main")
+            .with_context(|| "Config::read_from_file(): deserialize")
     }
 }
 
@@ -304,7 +303,15 @@ async fn subscribe_cmd(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let config = Arc::new(Config::read_from_file(""));
+    let matches = clap_app!(CubIpApp =>
+        (@arg CONFIG: -c --config +takes_value "Sets a custom config file"))
+    .get_matches();
+
+    let path_to_config = matches
+        .value_of("CONFIG")
+        .unwrap_or_else(|| "/usr/local/etc/cub_ip_app/config.toml");
+
+    let config = Arc::new(Config::read_from_file(path_to_config)?);
 
     let temperature_topic = format!("/{}/temperature", config.mqtt_main_topic);
     let relay_topic = format!("/{}/relay/state", config.mqtt_main_topic);

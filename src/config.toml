@@ -1,0 +1,11 @@
+[main]
+cub_ip_address = "192.168.0.117:80"
+cub_ip_login = "admin"
+cub_ip_password = "5555"
+cub_ip_connection_timeout = "500ms"
+cub_ip_read_timeout = "500ms"
+cub_ip_write_timeout = "500ms"
+cub_ip_request_timeout = "500ms"
+mqtt_main_topic = "cub_ip_device"
+mqtt_host = "192.168.0.114:1883"
+mqtt_name_client = "cub_ip_service"
