@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Context};
 use futures::stream::StreamExt;
 use log::{info, warn};
-use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io;
@@ -326,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let version_topic = format!("/{}/version", config.mqtt_main_topic);
 
     let decode_value_temperature_sensor = |v: &str| {
-        if v == "Обрыв датчика" {
+        if v == "Обрыв датчика" || v == "-" {
             return Ok("-".to_string());
         }
         if v.len() > 2 {
@@ -338,12 +337,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let decode_value_relay_state = |v: &str| match v {
         "0" | "2" => Ok("0".to_string()),
         "1" | "3" => Ok("1".to_string()),
+        "-" => Ok(v.to_string()),
         _ => Err(anyhow!("unknown relay value (value: {}).", v)),
     };
 
     let decode_value_pin_state = |v: &str| match v {
         "Сработка" => Ok("0".to_string()),
         "Норма" => Ok("1".to_string()),
+        "-" => Ok(v.to_string()),
         _ => Err(anyhow!("unknown pin value (value: {}).", v)),
     };
 
@@ -412,66 +413,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             prev_pin_2_value: &mut Option<String>,
                             prev_time_relay_value: &mut Option<String>| {
         let mut messages = vec![];
-        match response {
-            Ok(data) => {
-                let mut add_message = |topic: &str,
-                                       value: &anyhow::Result<String>,
-                                       prev_value: &mut Option<String>,
-                                       qos: i32| {
-                    match value {
-                        Ok(v) => {
-                            if let Some(prev) = prev_value {
-                                if prev == v {
-                                    return;
-                                }
-                            }
-                            messages.push(mqtt::Message::new_retained(topic, v.as_bytes(), qos));
-                            *prev_value = Some(v.clone());
+
+        let mut add_message = |topic: &str,
+                               value: &anyhow::Result<String>,
+                               prev_value: &mut Option<String>,
+                               qos: i32| {
+            match value {
+                Ok(v) => {
+                    if let Some(prev) = prev_value {
+                        if prev == v {
+                            return;
                         }
-                        Err(e) => {
-                            warn!("add message: {}", e);
-                        }
-                    };
-                };
+                    }
+                    messages.push(mqtt::Message::new_retained(topic, v.as_bytes(), qos));
+                    *prev_value = Some(v.clone());
+                }
+                Err(e) => {
+                    warn!("add message: {}", e);
+                }
+            };
+        };
 
-                add_message(
-                    &temperature_topic,
-                    &decode_value_temperature_sensor(data.trm.as_str()),
-                    prev_temperature_value,
-                    mqtt::QOS_0,
-                );
-
-                add_message(
-                    &relay_topic,
-                    &decode_value_relay_state(data.strel.as_str()),
-                    prev_relay_value,
-                    mqtt::QOS_1,
-                );
-
-                add_message(
-                    &pin_1_topic,
-                    &decode_value_pin_state(data.vle0.as_str()),
-                    prev_pin_1_value,
-                    mqtt::QOS_1,
-                );
-
-                add_message(
-                    &pin_2_topic,
-                    &decode_value_pin_state(data.vle1.as_str()),
-                    prev_pin_2_value,
-                    mqtt::QOS_1,
-                );
-                add_message(
-                    &relay_time_topic,
-                    &Ok::<String, anyhow::Error>(data.tmrel),
-                    prev_time_relay_value,
-                    mqtt::QOS_1,
-                );
+        let data = response.unwrap_or_else(|e| {
+            warn!("Parsed response failed ({:?}).", e);
+            CubIpResponse {
+                tm: "-".to_string(),
+                stv: "-".to_string(),
+                trm: "-".to_string(),
+                hih: "-".to_string(),
+                vle0: "-".to_string(),
+                vle1: "-".to_string(),
+                vle2: "-".to_string(),
+                vle3: "-".to_string(),
+                vle4: "-".to_string(),
+                vle5: "-".to_string(),
+                strel: "-".to_string(),
+                tmrel: "-".to_string(),
             }
-            Err(e) => {
-                warn!("Parsed response failed ({:?}).", e);
-            }
-        }
+        });
+
+        add_message(
+            &temperature_topic,
+            &decode_value_temperature_sensor(data.trm.as_str()),
+            prev_temperature_value,
+            mqtt::QOS_0,
+        );
+
+        add_message(
+            &relay_topic,
+            &decode_value_relay_state(data.strel.as_str()),
+            prev_relay_value,
+            mqtt::QOS_1,
+        );
+
+        add_message(
+            &pin_1_topic,
+            &decode_value_pin_state(data.vle0.as_str()),
+            prev_pin_1_value,
+            mqtt::QOS_1,
+        );
+
+        add_message(
+            &pin_2_topic,
+            &decode_value_pin_state(data.vle1.as_str()),
+            prev_pin_2_value,
+            mqtt::QOS_1,
+        );
+        add_message(
+            &relay_time_topic,
+            &Ok::<String, anyhow::Error>(data.tmrel),
+            prev_time_relay_value,
+            mqtt::QOS_1,
+        );
 
         async {
             for msg in messages {
