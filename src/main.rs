@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context};
 use futures::stream::StreamExt;
-use log::{info, warn};
+use log::{info, warn, LevelFilter};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io;
@@ -17,6 +17,7 @@ use paho_mqtt as mqtt;
 use paho_mqtt::QOS_1;
 use quick_xml::de::from_str;
 use serde::{de, Deserialize, Deserializer};
+use syslog::Facility;
 
 #[derive(Debug, Deserialize, PartialEq)]
 struct CubIpResponse {
@@ -58,6 +59,8 @@ struct Config {
     pub mqtt_main_topic: String,
     pub mqtt_host: String,
     pub mqtt_name_client: String,
+    #[serde(deserialize_with = "deserialize_level_filter_from_str")]
+    pub log_level: LevelFilter,
 }
 
 fn deserialize_duration_from_str<'de, D>(deserializer: D) -> Result<Duration, D::Error>
@@ -66,6 +69,22 @@ where
 {
     let s: String = Deserialize::deserialize(deserializer)?;
     parse_duration::parse(s.as_str()).map_err(de::Error::custom)
+}
+
+fn deserialize_level_filter_from_str<'de, D>(deserializer: D) -> Result<LevelFilter, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    match s.to_lowercase().as_str() {
+        "off" => Ok(LevelFilter::Off),
+        "error" => Ok(LevelFilter::Error),
+        "warn" => Ok(LevelFilter::Warn),
+        "info" => Ok(LevelFilter::Info),
+        "debug" => Ok(LevelFilter::Debug),
+        "trace" => Ok(LevelFilter::Trace),
+        _ => Err(de::Error::custom("Unknown level filter")),
+    }
 }
 
 impl Config {
@@ -300,8 +319,6 @@ async fn subscribe_cmd(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
-
     let matches = clap_app!(CubIpApp =>
         (@arg CONFIG: -c --config +takes_value "Sets a custom config file"))
     .get_matches();
@@ -311,6 +328,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "/usr/local/etc/cub_ip_app/config.toml");
 
     let config = Arc::new(Config::read_from_file(path_to_config)?);
+
+    syslog::init(Facility::LOG_USER, config.log_level, None).unwrap();
 
     let temperature_topic = format!("/{}/temperature", config.mqtt_main_topic);
     let relay_topic = format!("/{}/relay/state", config.mqtt_main_topic);
