@@ -1,0 +1,15 @@
+[Unit]
+Description=CubIpApp - bridge between KubIp device and mqtt
+After=network.target syslog.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cub-ip-app -c /etc/cub_ip_app.toml
+KillMode=control-group
+Restart=on-abort
+User=cub-ip-app
+Group=cub-ip-app
+WorkingDirectory=/tmp
+
+[Install]
+WantedBy=multi-user.target

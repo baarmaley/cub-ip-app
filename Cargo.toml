@@ -21,3 +21,15 @@ config = "0.11.0"
 clap = "2.34.0"
 parse_duration = "2.1.1"
 syslog = "6.0.0"
+
+[package.metadata.deb]
+maintainer = "Maksim Tsvetkov <max.tsvetkov@yandex.ru>"
+extended-description = """CubIpApp - bridge between KubIp device and mqtt"""
+depends = "$auto"
+conf-files = ["etc/cub_ip_app.toml"]
+assets = [
+    ["target/release/cub-ip-app", "usr/bin/", "755"],
+    ["src/cub_ip_app.toml", "etc/", "744"],
+]
+maintainer-scripts = "debian/"
+systemd-units = { enable = true }

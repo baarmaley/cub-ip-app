@@ -23,7 +23,7 @@ use syslog::Facility;
 struct CubIpResponse {
     tm: String,
     stv: String,
-    trm: String, // temperatura
+    trm: String, // temperature
     hih: String,
     vle0: String, // pin 1
     vle1: String, // pin 2
@@ -538,8 +538,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -552,7 +550,7 @@ mod test {
     async fn action_request() {
         env_logger::init();
 
-        let config = Arc::new(Config::read_from_file(""));
+        let config = Arc::new(Config::read_from_file("").unwrap());
 
         request_relay_action(&config, CubIpRelayAction::TimeRelayTurnOn(15))
             .await

@@ -1,0 +1,6 @@
+#!/bin/bash
+
+groupadd cub-ip-app || true
+useradd -g cub-ip-app cub-ip-app || true
+
+#DEBHELPER#

@@ -1,0 +1,7 @@
+#!/bin/bash
+
+#DEBHELPER#
+
+userdel -r cub-ip-app || true
+groupdel cub-ip-app || true
+

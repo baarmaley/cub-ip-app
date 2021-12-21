@@ -1,2 +1,4 @@
 /.idea
 /target
+/raspberry_pi_build/registry/
+Cargo.lock
