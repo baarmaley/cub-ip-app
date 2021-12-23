@@ -1,321 +1,26 @@
-use anyhow::{anyhow, Context};
-use futures::stream::StreamExt;
-use log::{info, warn, LevelFilter};
+mod common;
+mod config;
+mod cub_ip_client;
+mod mqtt_client;
+
+use anyhow::anyhow;
+use log::{info, warn};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::unbounded_channel;
 
 extern crate quick_xml;
 extern crate serde;
 #[macro_use]
 extern crate clap;
 
+use crate::common::{CubIpResponse, Task};
+use crate::config::Config;
+use crate::cub_ip_client::request_status;
+use crate::mqtt_client::{publish_version, subscribe_cmd};
 use paho_mqtt as mqtt;
 use paho_mqtt::QOS_1;
-use quick_xml::de::from_str;
-use serde::{de, Deserialize, Deserializer};
 use syslog::Facility;
-
-#[derive(Debug, Deserialize, PartialEq)]
-struct CubIpResponse {
-    tm: String,
-    stv: String,
-    trm: String, // temperature
-    hih: String,
-    vle0: String, // pin 1
-    vle1: String, // pin 2
-    vle2: String,
-    vle3: String,
-    vle4: String,
-    vle5: String,
-    strel: String, // relay 0: turn off; 1: turn on;  2: turn off (time relay) 3: turn on (time relay)
-    tmrel: String, // time relay
-}
-
-#[derive(Debug)]
-enum CubIpRelayAction {
-    RelayTurnOn,
-    RelayTurnOff,
-    TimeRelayTurnOn(usize),
-    TimeRelayTurnOff(usize),
-}
-
-#[derive(Deserialize)]
-struct Config {
-    pub cub_ip_address: String,
-    pub cub_ip_login: String,
-    pub cub_ip_password: String,
-    #[serde(deserialize_with = "deserialize_duration_from_str")]
-    pub cub_ip_connection_timeout: Duration,
-    #[serde(deserialize_with = "deserialize_duration_from_str")]
-    pub cub_ip_read_timeout: Duration,
-    #[serde(deserialize_with = "deserialize_duration_from_str")]
-    pub cub_ip_write_timeout: Duration,
-    #[serde(deserialize_with = "deserialize_duration_from_str")]
-    pub cub_ip_request_timeout: Duration,
-    pub mqtt_main_topic: String,
-    pub mqtt_host: String,
-    pub mqtt_name_client: String,
-    #[serde(deserialize_with = "deserialize_level_filter_from_str")]
-    pub log_level: LevelFilter,
-}
-
-fn deserialize_duration_from_str<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    parse_duration::parse(s.as_str()).map_err(de::Error::custom)
-}
-
-fn deserialize_level_filter_from_str<'de, D>(deserializer: D) -> Result<LevelFilter, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    match s.to_lowercase().as_str() {
-        "off" => Ok(LevelFilter::Off),
-        "error" => Ok(LevelFilter::Error),
-        "warn" => Ok(LevelFilter::Warn),
-        "info" => Ok(LevelFilter::Info),
-        "debug" => Ok(LevelFilter::Debug),
-        "trace" => Ok(LevelFilter::Trace),
-        _ => Err(de::Error::custom("Unknown level filter")),
-    }
-}
-
-impl Config {
-    pub fn read_from_file(path: &str) -> anyhow::Result<Config> {
-        let mut settings = config::Config::default();
-        settings
-            .merge(config::File::with_name(path))
-            .with_context(|| format!("Config::read_from_file(): open file {}", path))?;
-
-        settings
-            .get("main")
-            .with_context(|| "Config::read_from_file(): deserialize")
-    }
-}
-
-async fn request_to_cub_ip(config: &Arc<Config>, path: &str) -> anyhow::Result<Vec<u8>> {
-    let authorization_base64 = base64::encode(format!(
-        "{}:{}",
-        config.cub_ip_login, config.cub_ip_password
-    ));
-
-    let raw_request = format!(
-        "GET {} HTTP/1.1\r\n\
-Host: {}\r\n\
-User-Agent: cub-ip-app\r\n\
-Accept: */*\r\n\
-Authorization: Basic {}\r\n\
-\r\n\
-",
-        path, &config.cub_ip_address, authorization_base64
-    );
-
-    let mut stream = tokio::time::timeout(
-        config.cub_ip_connection_timeout,
-        TcpStream::connect(&config.cub_ip_address),
-    )
-    .await
-    .with_context(|| "connection timeout expired.")??;
-
-    // Write some data.
-    tokio::time::timeout(
-        config.cub_ip_write_timeout,
-        stream.write_all(raw_request.as_bytes()),
-    )
-    .await
-    .with_context(|| "write timeout expired.")??;
-
-    let mut response_buf = Vec::new();
-
-    loop {
-        // Wait for the socket to be readable
-        tokio::time::timeout(config.cub_ip_read_timeout, stream.readable())
-            .await
-            .with_context(|| "read timeout expired.")??;
-
-        // Creating the buffer **after** the `await` prevents it from
-        // being stored in the async task.
-        let mut buf = [0; 4096];
-
-        // Try to read data, this may still fail with `WouldBlock`
-        // if the readiness event is a false positive.
-        match stream.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                response_buf.extend_from_slice(&buf[..n]);
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                continue;
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
-    }
-
-    Ok(response_buf)
-}
-
-async fn request_relay_action(
-    config: &Arc<Config>,
-    action: CubIpRelayAction,
-) -> anyhow::Result<()> {
-    let parameters = match action {
-        CubIpRelayAction::RelayTurnOn => (1usize, 0),
-        CubIpRelayAction::RelayTurnOff => (0, 0),
-        CubIpRelayAction::TimeRelayTurnOn(time) => (3, time),
-        CubIpRelayAction::TimeRelayTurnOff(time) => (2, time),
-    };
-    let response_buf = request_to_cub_ip(
-        &config,
-        format!("/sw.cgi?r=r{}&val={}", parameters.0, parameters.1).as_str(),
-    )
-    .await?;
-    let is_response_ok = std::str::from_utf8(&response_buf)
-        .ok()
-        .and_then(|str| str.find("HTTP/1.1 200 OK"))
-        .is_some();
-
-    info!(
-        "request relay action: {:?} is {}",
-        parameters, is_response_ok
-    );
-    Ok(())
-}
-
-async fn request_status(
-    config: Arc<Config>,
-    sender: UnboundedSender<Task>,
-    mqtt_client: mqtt::AsyncClient,
-) {
-    let request_state = || {
-        async {
-            let response_buf = request_to_cub_ip(&config, "/status.xml").await?;
-            let raw_xml = std::str::from_utf8(&response_buf).ok().and_then(|str| {
-                let xmls = str
-                    .split("\r\n\r\n")
-                    .filter(|x| x.starts_with("<?xml version="))
-                    .collect::<Vec<&str>>();
-                if xmls.len() == 1 {
-                    return Some(xmls[0]);
-                }
-                None
-            });
-
-            if let Some(xml) = raw_xml {
-                let response: CubIpResponse = from_str(xml)?;
-                //println!("response: {:?}", response);
-                return Ok::<CubIpResponse, anyhow::Error>(response);
-            }
-
-            Err(anyhow!("Response failed"))
-        }
-    };
-
-    loop {
-        if mqtt_client.is_connected() {
-            if let Err(e) = sender.send(Task::Response(request_state().await)) {
-                warn!("send to mqtt worker failed ({:?})", e);
-                break;
-            }
-        }
-        tokio::time::sleep(config.cub_ip_request_timeout).await;
-    }
-}
-
-#[derive(Debug)]
-enum Task {
-    Response(anyhow::Result<CubIpResponse>),
-    ResetPrevValue,
-}
-
-async fn publish_version(version_topic: &str, mqtt_client: &mqtt::AsyncClient) {
-    if let Err(e) = mqtt_client
-        .publish(mqtt::Message::new_retained(
-            version_topic,
-            env!("CARGO_PKG_VERSION"),
-            QOS_1,
-        ))
-        .await
-    {
-        warn!("Publish verstion failed ({:?})", e);
-    }
-}
-
-async fn subscribe_cmd(
-    config: Arc<Config>,
-    relay_cmd_topic: String,
-    time_relay_turn_on_cmd_topic: String,
-    time_relay_turn_off_cmd_topic: String,
-    mqtt_client: mqtt::AsyncClient,
-    mut strm: futures::channel::mpsc::Receiver<Option<mqtt::Message>>,
-) {
-    while !mqtt_client.is_connected() {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
-    while let Err(e) = mqtt_client
-        .subscribe_many(
-            &[
-                &relay_cmd_topic,
-                &time_relay_turn_on_cmd_topic,
-                &time_relay_turn_off_cmd_topic,
-            ],
-            &[mqtt::QOS_1, mqtt::QOS_1, mqtt::QOS_1],
-        )
-        .await
-    {
-        warn!("subscribe on mqtt topic failed ({:?}).", e);
-    }
-
-    while let Some(msg_opt) = strm.next().await {
-        if let Some(msg) = msg_opt {
-            // let payload = std::str::from_utf8(msg.payload().);
-            let to_usize = |time_as_str: &[u8]| {
-                std::str::from_utf8(time_as_str)
-                    .map(|v| v.parse::<usize>().ok())
-                    .ok()
-                    .flatten()
-            };
-
-            let action = if msg.topic() == relay_cmd_topic {
-                match msg.payload() {
-                    b"0" => Some(CubIpRelayAction::RelayTurnOff),
-                    b"1" => Some(CubIpRelayAction::RelayTurnOn),
-                    _ => None,
-                }
-            } else if msg.topic() == time_relay_turn_on_cmd_topic {
-                to_usize(msg.payload()).map(|v| CubIpRelayAction::TimeRelayTurnOn(v))
-            } else if msg.topic() == time_relay_turn_off_cmd_topic {
-                to_usize(msg.payload()).map(|v| CubIpRelayAction::TimeRelayTurnOff(v))
-            } else {
-                None
-            };
-
-            if let Some(action) = action {
-                if let Err(e) = request_relay_action(&config, action).await {
-                    warn!("request_relay_action failed ({:?})", e);
-                }
-                continue;
-            }
-            warn!("unknown cmd {}.", msg);
-        } else {
-            // A "None" means we were disconnected. Wait for reconnect...
-            while !mqtt_client.is_connected() {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            info!("mqtt cmd reconnect recovery");
-        }
-    }
-    warn!("subscribe loop exit.");
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -325,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let path_to_config = matches
         .value_of("CONFIG")
-        .unwrap_or_else(|| "/usr/local/etc/cub_ip_app/config.toml");
+        .unwrap_or("/usr/local/etc/cub_ip_app/config.toml");
 
     let config = Arc::new(Config::read_from_file(path_to_config)?);
 
@@ -520,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match task {
                 Task::Response(response) => {
                     response_process(
-                        response,
+                        *response,
                         &mut prev_temperature_value,
                         &mut prev_relay_value,
                         &mut prev_pin_1_value,
@@ -542,7 +247,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod test {
-    use crate::{request_relay_action, Config, CubIpRelayAction};
+    use crate::common::CubIpRelayAction;
+    use crate::cub_ip_client::request_relay_action;
+    use crate::Config;
     use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
